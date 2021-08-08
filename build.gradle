@@ -1,0 +1,23 @@
+plugins {
+    id 'java'
+}
+
+group 'io.xentripetal'
+version '2.31.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.apache.beam:beam-sdks-java-core:2.31.0'
+    implementation 'org.apache.beam:beam-sdks-java-io-jdbc:2.31.0'
+    implementation 'com.google.auto.value:auto-value-annotations:1.8.2'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.7.0'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.7.0'
+    implementation 'org.slf4j:slf4j-api:1.7.32'
+}
+
+test {
+    useJUnitPlatform()
+}
