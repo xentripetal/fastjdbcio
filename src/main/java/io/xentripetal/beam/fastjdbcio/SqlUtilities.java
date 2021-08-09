@@ -1,4 +1,4 @@
-package io.xentripetal.fastjdbcio;
+package io.xentripetal.beam.fastjdbcio;
 
 import java.util.List;
 
