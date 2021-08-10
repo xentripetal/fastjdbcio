@@ -4,6 +4,7 @@ import com.google.auto.value.AutoValue;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.io.jdbc.JdbcIO;
 import org.apache.beam.sdk.io.jdbc.JdbcIO.PreparedStatementSetter;
+import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.*;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.values.KV;
@@ -40,22 +41,6 @@ public class FastJdbcIO {
     public static <T> ReadWithDistinctPartitions<T> readWithDistinctPartitions() {
         return new AutoValue_FastJdbcIO_ReadWithDistinctPartitions.Builder<T>()
                 .setSetSize(1)
-                .setJdbcOptions(jdbcOptions())
-                .build();
-    }
-
-    public static <T> JdbcOptions<T> jdbcOptions() {
-        return new AutoValue_FastJdbcIO_JdbcOptions.Builder<T>()
-                .setOutputParallelization(false)
-                .build();
-    }
-
-    /**
-     * Allows for overriding the final queries used in FastJdbcIO.
-     */
-    public static SqlElements sqlElements() {
-        return new AutoValue_FastJdbcIO_SqlElements.Builder()
-                .setSelectStatement("*")
                 .build();
     }
 
@@ -66,36 +51,63 @@ public class FastJdbcIO {
         }
     };
 
+    static boolean isActiveValueProvider(ValueProvider<String> vp) {
+        if (vp == null) {
+            return false;
+        }
+        String value = vp.get();
+        return value != null && !value.equals("");
+    }
+
     @AutoValue
     public abstract static class SqlElements {
-        abstract @Nullable String getSelectStatement();
+        /**
+         * Properties for which table to query and overriding queries used.
+         */
+        public static SqlElements create(ValueProvider<String> table) {
+            return new AutoValue_FastJdbcIO_SqlElements.Builder()
+                    .setSelectStatement(ValueProvider.StaticValueProvider.of("*"))
+                    .setTable(table)
+                    .build();
+        }
 
-        abstract @Nullable String getTable();
+        /**
+         * Properties for which table to query and overriding queries used.
+         */
+        public static SqlElements create(String table) {
+            return new AutoValue_FastJdbcIO_SqlElements.Builder()
+                    .setSelectStatement(ValueProvider.StaticValueProvider.of("*"))
+                    .setTable(ValueProvider.StaticValueProvider.of(table))
+                    .build();
+        }
 
-        abstract @Nullable String getWhereExtension();
+        abstract @Nullable ValueProvider<String> getSelectStatement();
 
-        abstract @Nullable String getPrefixSql();
+        abstract @Nullable ValueProvider<String> getTable();
+
+        abstract @Nullable ValueProvider<String> getWhereExtension();
+
+        abstract @Nullable ValueProvider<String> getPrefixSql();
 
         abstract Builder toBuilder();
 
         @AutoValue.Builder
         abstract static class Builder {
 
-            public abstract Builder setSelectStatement(@Nullable String newSelectStatement);
+            public abstract Builder setSelectStatement(ValueProvider<String> selectStatement);
 
-            public abstract Builder setTable(@Nullable String newTable);
+            public abstract Builder setTable(ValueProvider<String> table);
 
-            public abstract Builder setWhereExtension(@Nullable String newWhereExtension);
+            public abstract Builder setWhereExtension(ValueProvider<String> whereExtension);
 
-            public abstract Builder setPrefixSql(@Nullable String newPrefixSql);
+            public abstract Builder setPrefixSql(ValueProvider<String> prefixSql);
 
             abstract SqlElements build();
         }
 
         public void verifyProperties() {
             checkNotNull(getSelectStatement(), "Select statement can not be null, either don't set it or use * for default.");
-            checkNotNull(getTable(), "withTable() is required");
-            checkArgument(!Objects.equals(getWhereExtension(), ""), "Predicate Extension should not be an empty string. Set to null to not use.");
+            checkNotNull(getTable(), "Table cannot be null");
         }
 
 
@@ -110,6 +122,19 @@ public class FastJdbcIO {
          */
         public SqlElements withSelectStatement(String selectStatement) {
             checkNotNull(selectStatement, "Select statement can not be null, either don't set it or use * for default.");
+            return withSelectStatement(ValueProvider.StaticValueProvider.of(selectStatement));
+        }
+
+        /**
+         * Sets the select statement the final query used in the reader that this is passed to.
+         * <p>
+         * e.g. if the reader uses <code>"SELECT * FROM schema.table"</code>
+         * and you specify "a, b AS fixed_b" as the <code>selectStatement</code>
+         * it will produce <code>"SELECT a, b AS fixed_b FROM schema.table"</code>
+         *
+         * @param selectStatement The select statement to use, defaults to *
+         */
+        public SqlElements withSelectStatement(ValueProvider<String> selectStatement) {
             return toBuilder().setSelectStatement(selectStatement).build();
         }
 
@@ -124,7 +149,23 @@ public class FastJdbcIO {
          * @param table The sql to place in the FROM clause.
          */
         public SqlElements withTable(String table) {
-            checkNotNull(table, "Select statement can not be null, either don't set it or use * for default.");
+            checkNotNull(table, "Table cannot be null");
+            return withTable(ValueProvider.StaticValueProvider.of(table));
+        }
+
+
+        /**
+         * Sets the table to query. It can also be a subquery as the table parameter will simply be inserted after the
+         * FROM clause
+         * <p>
+         * e.g. if the reader uses <code>"SELECT * FROM "</code>
+         * and you specify "(SELECT A FROM schema.table)" as the <code>table</code>
+         * it will produce <code>"SELECT * FROM (SELECT A FROM schema.table)"</code>
+         *
+         * @param table The sql to place in the FROM clause.
+         */
+        public SqlElements withTable(ValueProvider<String> table) {
+            checkNotNull(table, "Table cannot be null");
             return toBuilder().setTable(table).build();
         }
 
@@ -137,11 +178,24 @@ public class FastJdbcIO {
          * and you specify "b > 5" as the <code>predicateExtension</code>
          * it will produce <code>"SELECT * FROM schema.table WHERE (a = 'value') AND (b > 5)"</code>
          *
-         * @param whereExtension predicate sql to extend with. Do not use empty string, instead use null for not using
-         *                       any extension.
+         * @param whereExtension predicate sql to extend with.
          */
         public SqlElements withWhereExtension(String whereExtension) {
-            checkArgument(whereExtension == null || whereExtension.length() > 0, "Predicate Extension should not be an empty string. Set to null to not use.");
+            return withWhereExtension(ValueProvider.StaticValueProvider.of(whereExtension));
+        }
+
+        /**
+         * Appends this clause to the final query used in the reader this is passed to. It will be added on
+         * as an AND to any predicates that the query is using for implementation. You do not need to specify wrapping
+         * parenthesis.
+         * <p>
+         * e.g. if the reader uses <code>"SELECT * FROM schema.table WHERE a = 'value'"</code>
+         * and you specify "b > 5" as the <code>predicateExtension</code>
+         * it will produce <code>"SELECT * FROM schema.table WHERE (a = 'value') AND (b > 5)"</code>
+         *
+         * @param whereExtension predicate sql to extend with.
+         */
+        public SqlElements withWhereExtension(ValueProvider<String> whereExtension) {
             return toBuilder().setWhereExtension(whereExtension).build();
         }
 
@@ -158,61 +212,76 @@ public class FastJdbcIO {
          * @param prefixSql SQL to insert before generated sql
          */
         public SqlElements withPrefixSql(String prefixSql) {
+            return withPrefixSql(ValueProvider.StaticValueProvider.of(prefixSql));
+        }
+
+
+        /**
+         * Prefixes the provided prefixSql onto the generated query used by the reader this is passed to.
+         * <p>
+         * This allows for running CTE blocks with custom logic, simply change the table to be the name of whichever
+         * CTE block you are wanting to read from.
+         * </p><p>
+         * e.g. if the reader uses <code>"SELECT * FROM schema.table</code>
+         * and you specify "with example as (SELECT * FROM another.table)" as the <code>prefixSql</code> and "example" as the <code>table</code>
+         * it will produce <code>"with example as (SELECT * FROM another.table) SELECT * FROM example</code>
+         *
+         * @param prefixSql SQL to insert before generated sql
+         */
+        public SqlElements withPrefixSql(ValueProvider<String> prefixSql) {
             return toBuilder().setPrefixSql(prefixSql).build();
         }
 
-        protected String generateSql(String selectorOverride, String whereClause, String postfix) {
-            StringBuilder query = new StringBuilder();
-            String selector = selectorOverride;
-            if (selector == null) {
-                selector = getSelectStatement();
-            }
+        protected ValueProvider<String> generateSql(ValueProvider<String> selectorOverride, ValueProvider<String> whereClause, ValueProvider<String> postfix) {
+            StringBuilderValueProvider query = StringBuilderValueProvider.of();
             if (getPrefixSql() != null) {
                 query.append(getPrefixSql());
                 query.append(" ");
             }
-
             query.append("SELECT ");
-            query.append(selector);
+            if (selectorOverride != null) {
+                query.append(selectorOverride);
+            } else {
+                query.append(getSelectStatement());
+            }
+
             query.append(" FROM ");
             query.append(getTable());
 
-
-            // This is kind of messy. Maybe make a graph based model for representing SQL if we have to keep
-            // doing stuff like this.
-            StringBuilder clause = new StringBuilder();
+            StringBuilderValueProvider clause = StringBuilderValueProvider.of();
             if (whereClause != null) {
+                clause.append(" WHERE ");
                 clause.append(whereClause);
-            }
-            if (getWhereExtension() != null) {
-                if (clause.length() > 0) {
-                    clause.insert(0, '(');
-                    clause.append(") AND ");
+                if (getWhereExtension() != null) {
+                    clause.insert(0, "(");
+                    clause.append(") AND (");
+                    clause.append(getWhereExtension());
+                    clause.append(")");
                 }
+            } else if (getWhereExtension() != null) {
+                clause.append(" WHERE ");
                 clause.append(getWhereExtension());
             }
-            if (clause.length() > 0) {
-                query.append(" WHERE ");
-                query.append(clause);
-            }
+
+            query.append(clause);
 
             if (postfix != null) {
                 query.append(" ");
                 query.append(postfix);
             }
 
-            return query.toString();
+            return query;
         }
-
-        @Override
-        public String toString() {
-            return generateSql(null, null, null);
-        }
-
     }
 
     @AutoValue
     public abstract static class JdbcOptions<T> {
+        public static <T> JdbcOptions<T> create() {
+            return new AutoValue_FastJdbcIO_JdbcOptions.Builder<T>()
+                    .setOutputParallelization(true)
+                    .build();
+        }
+
         abstract @Nullable SerializableFunction<Void, DataSource> getDataSourceProviderFn();
 
         abstract JdbcIO.RowMapper<T> getRowMapper();
@@ -307,9 +376,9 @@ public class FastJdbcIO {
     @AutoValue
     public abstract static class ReadWithDistinctPartitions<T> extends PTransform<PBegin, PCollection<T>> {
 
-        abstract @Nullable List<String> getPartitionColumns();
+        abstract @Nullable ValueProvider<List<String>> getPartitionColumns();
 
-        abstract int getSetSize();
+        abstract long getSetSize();
 
         abstract JdbcOptions<T> getJdbcOptions();
 
@@ -317,11 +386,11 @@ public class FastJdbcIO {
 
         @AutoValue.Builder
         abstract static class Builder<T> {
-            abstract Builder<T> setPartitionColumns(List<String> partitionColumns);
+            abstract Builder<T> setPartitionColumns(ValueProvider<List<String>> partitionColumns);
 
             abstract Builder<T> setJdbcOptions(JdbcOptions<T> jdbcOptions);
 
-            abstract Builder<T> setSetSize(int setSize);
+            abstract Builder<T> setSetSize(long setSize);
 
             abstract ReadWithDistinctPartitions<T> build();
         }
@@ -341,18 +410,27 @@ public class FastJdbcIO {
          * The number of distinct value sets per query. When set to 1, a query will be run for every combination of
          * values for the set partition columns.
          */
-        public ReadWithDistinctPartitions<T> withSetSize(int setSize) {
+        public ReadWithDistinctPartitions<T> withSetSize(long setSize) {
             checkArgument(setSize > 0, "setSize cannot be less than 1");
-            return toBuilder().setSetSize(setSize).build();
+            return withSetSize(setSize);
+        }
+
+
+        /**
+         * List of the name of columns to use for partitioning by value
+         */
+        public ReadWithDistinctPartitions<T> withPartitionColumns(List<String> partitionColumns) {
+            checkNotNull(partitionColumns, "partitionColumns can not be null");
+            checkArgument(partitionColumns.size() > 0, "You must specify at least one partition column");
+            return withPartitionColumns(ValueProvider.StaticValueProvider.of(partitionColumns));
         }
 
         /**
          * List of the name of columns to use for partitioning by value
          */
-        public ReadWithDistinctPartitions<T> withPartitionColumns(List<String> partitionColumn) {
-            checkNotNull(partitionColumn, "partitionColumn can not be null");
-            checkArgument(partitionColumn.size() > 0, "You must specify at least one partition column");
-            return toBuilder().setPartitionColumns(partitionColumn).build();
+        public ReadWithDistinctPartitions<T> withPartitionColumns(ValueProvider<List<String>> partitionColumns) {
+            checkNotNull(partitionColumns, "partitionColumns can not be null");
+            return toBuilder().setPartitionColumns(partitionColumns).build();
         }
 
         /**
@@ -360,36 +438,56 @@ public class FastJdbcIO {
          *
          * @return sql
          */
-        private String generateSql() {
-            List<String> partitionColumns = getPartitionColumns();
+        private ValueProvider<String> generateSql() {
 
-            // Build the base clause of COLUMN_A = ? AND COLUMN_B = ? AND etc...
-            StringBuilder partitionClausesBuilder = new StringBuilder();
-            for (int i = 0; i < partitionColumns.size(); i++) {
-                partitionClausesBuilder.append(partitionColumns.get(i) + " = ?");
-                if (i < partitionColumns.size() - 1) {
-                    partitionClausesBuilder.append(" AND ");
-                }
-            }
-            String partitionClauses = partitionClausesBuilder.toString();
-
-            // Duplicate the partition clause for each entry in the set
-            StringBuilder clause = new StringBuilder();
-            if (getSetSize() > 1) {
-                for (int i = 0; i < getSetSize(); i++) {
-                    clause.append("(" + partitionClauses + ")");
-                    if (i < getSetSize() - 1) {
-                        clause.append(" OR ");
+            SerializableFunction<List<String>, String> clauseBuilder = new SerializableFunction<List<String>, String>() {
+                @Override
+                public String apply(List<String> partitionColumns) {
+                    // Build the base clause of COLUMN_A = ? AND COLUMN_B = ? AND etc...
+                    StringBuilder partitionClausesBuilder = new StringBuilder();
+                    for (int i = 0; i < partitionColumns.size(); i++) {
+                        partitionClausesBuilder.append(partitionColumns.get(i) + " = ?");
+                        if (i < partitionColumns.size() - 1) {
+                            partitionClausesBuilder.append(" AND ");
+                        }
                     }
+                    String partitionClauses = partitionClausesBuilder.toString();
+
+                    long setSize = getSetSize();
+                    // Duplicate the partition clause for each entry in the set
+                    StringBuilder clause = new StringBuilder();
+                    if (setSize > 1) {
+                        for (int i = 0; i < setSize; i++) {
+                            clause.append("(" + partitionClauses + ")");
+                            if (i < setSize - 1) {
+                                clause.append(" OR ");
+                            }
+                        }
+                    } else {
+                        // Don't add extra parenthesis. Its probably fine to just leave them in there but I've dealt with too
+                        // many DB2 databases to trust anything.
+                        clause.append(partitionClauses);
+                    }
+                    return clause.toString();
                 }
-            } else {
-                // Don't add extra parenthesis. Its probably fine to just leave them in there but I've dealt with too
-                // many DB2 databases to trust anything.
-                clause.append(partitionClauses);
-            }
+            };
 
+            ValueProvider<String> clause = ValueProvider.NestedValueProvider.of(getPartitionColumns(), clauseBuilder);
+            return getJdbcOptions().getSqlElements().generateSql(null, clause, null);
+        }
 
-            return getJdbcOptions().getSqlElements().generateSql(null, clause.toString(), null);
+        ValueProvider<String> generatePartitionValueSql() {
+            ValueProvider<String> columnNames = ValueProvider.NestedValueProvider.of(getPartitionColumns(), new SerializableFunction<List<String>, String>() {
+                @Override
+                public String apply(List<String> input) {
+                    return SqlUtilities.toColumnSelect(input);
+                }
+            });
+
+            return getJdbcOptions().getSqlElements().generateSql(
+                    StringBuilderValueProvider.of("DISTINCT ").append(columnNames),
+                    null,
+                    StringBuilderValueProvider.of("GROUP BY ").append(columnNames));
         }
 
         class DistinctParameterSetter implements PreparedStatementSetter<KV<String, Iterable<Row>>> {
@@ -410,18 +508,15 @@ public class FastJdbcIO {
             checkNotNull(getJdbcOptions(), "withJdbcOptions() is required");
             JdbcOptions<T> opts = getJdbcOptions();
             opts.verifyProperties();
-            checkNotNull(getPartitionColumns(), "withPartitionColumns() is required");
-            checkArgument(getPartitionColumns().size() == 0, "Partition Columns must have at least one element");
-            checkArgument(getSetSize() > 0, "SetSize must be greater than 0");
+            checkNotNull(getPartitionColumns(), "Partition Columns can not be null");
+            checkNotNull(getSetSize(), "setSize can not be null");
 
 
-            String columnNames = SqlUtilities.toColumnSelect(getPartitionColumns());
             PCollection<Row> distinctValues = input.apply("Read distinct values", opts.toReadRow()
-                    .withQuery(opts.getSqlElements().generateSql("DISTINCT " + columnNames, null, "GROUP BY " + columnNames)));
+                    .withQuery(generatePartitionValueSql()));
 
             PCollection<KV<String, Iterable<Row>>> batches = distinctValues.apply("Add Key", MapElements.via(FastJdbcIO.ToStaticKey))
                     .apply(GroupIntoBatches.ofSize(getSetSize()));
-
 
             return batches.apply("Read batches", opts.<KV<String, Iterable<Row>>>toReadAll()
                     .withQuery(generateSql())
