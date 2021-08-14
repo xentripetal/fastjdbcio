@@ -1,22 +1,22 @@
 package io.xentripetal.beam.fastjdbcio;
 
 import com.google.auto.value.AutoValue;
-import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.coders.*;
 import org.apache.beam.sdk.io.jdbc.JdbcIO;
 import org.apache.beam.sdk.io.jdbc.JdbcIO.PreparedStatementSetter;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.*;
 import org.apache.beam.sdk.transforms.display.DisplayData;
-import org.apache.beam.sdk.values.KV;
-import org.apache.beam.sdk.values.PBegin;
-import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.sdk.values.Row;
+import org.apache.beam.sdk.values.*;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.sql.DataSource;
+import java.io.Serializable;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -41,23 +41,18 @@ public class FastJdbcIO {
     public static <T> ReadWithDistinctPartitions<T> readWithDistinctPartitions() {
         return new AutoValue_FastJdbcIO_ReadWithDistinctPartitions.Builder<T>()
                 .setSetSize(1)
+                .setJdbcOptions(JdbcOptions.create())
                 .build();
     }
 
-    static final InferableFunction<Row, KV<String, Row>> ToStaticKey = new InferableFunction<Row, KV<String, Row>>() {
-        @Override
-        public KV<String, Row> apply(Row input) throws Exception {
-            return KV.of("a", input);
-        }
-    };
-
-    static boolean isActiveValueProvider(ValueProvider<String> vp) {
-        if (vp == null) {
-            return false;
-        }
-        String value = vp.get();
-        return value != null && !value.equals("");
+    /**
+     * An interface used by {@link FastJdbcIO} for converting each row of the {@link ResultSet} into
+     * an element of the resulting {@link PCollection}.
+     */
+    @FunctionalInterface
+    public interface RowMapper<T> extends JdbcIO.RowMapper<T> {
     }
+
 
     @AutoValue
     public abstract static class SqlElements {
@@ -275,18 +270,32 @@ public class FastJdbcIO {
     }
 
     @AutoValue
-    public abstract static class JdbcOptions<T> {
+    public abstract static class JdbcOptions<T> implements Serializable {
         public static <T> JdbcOptions<T> create() {
             return new AutoValue_FastJdbcIO_JdbcOptions.Builder<T>()
                     .setOutputParallelization(true)
                     .build();
         }
 
+        public static <T> JdbcOptions<T> create(String table) {
+            return new AutoValue_FastJdbcIO_JdbcOptions.Builder<T>()
+                    .setOutputParallelization(true)
+                    .setSqlElements(SqlElements.create(table))
+                    .build();
+        }
+
+        public static <T> JdbcOptions<T> create(ValueProvider<String> table) {
+            return new AutoValue_FastJdbcIO_JdbcOptions.Builder<T>()
+                    .setOutputParallelization(true)
+                    .setSqlElements(SqlElements.create(table))
+                    .build();
+        }
+
         abstract @Nullable SerializableFunction<Void, DataSource> getDataSourceProviderFn();
 
-        abstract JdbcIO.RowMapper<T> getRowMapper();
+        abstract @Nullable RowMapper<T> getRowMapper();
 
-        abstract SqlElements getSqlElements();
+        abstract @Nullable SqlElements getSqlElements();
 
         abstract @Nullable Coder<T> getCoder();
 
@@ -299,7 +308,7 @@ public class FastJdbcIO {
 
             abstract Builder<T> setDataSourceProviderFn(SerializableFunction<Void, DataSource> dataSourceProviderFn);
 
-            abstract Builder<T> setRowMapper(JdbcIO.RowMapper<T> rowMapper);
+            abstract Builder<T> setRowMapper(RowMapper<T> rowMapper);
 
             abstract Builder<T> setSqlElements(SqlElements sqlElements);
 
@@ -349,7 +358,7 @@ public class FastJdbcIO {
             return toBuilder().setDataSourceProviderFn(dataSourceProviderFn).build();
         }
 
-        public JdbcOptions<T> withRowMapper(JdbcIO.RowMapper<T> rowMapper) {
+        public JdbcOptions<T> withRowMapper(RowMapper<T> rowMapper) {
             checkNotNull(rowMapper, "rowMapper can not be null");
             return toBuilder().setRowMapper(rowMapper).build();
         }
@@ -502,6 +511,8 @@ public class FastJdbcIO {
             }
         }
 
+        protected PCollection<Row> distinctValues;
+        protected PCollection<KV<String, Iterable<Row>>> batches;
 
         @Override
         public PCollection<T> expand(PBegin input) {
@@ -512,11 +523,17 @@ public class FastJdbcIO {
             checkNotNull(getSetSize(), "setSize can not be null");
 
 
-            PCollection<Row> distinctValues = input.apply("Read distinct values", opts.toReadRow()
+            distinctValues = input.apply("Read distinct values", opts.toReadRow()
                     .withQuery(generatePartitionValueSql()));
 
-            PCollection<KV<String, Iterable<Row>>> batches = distinctValues.apply("Add Key", MapElements.via(FastJdbcIO.ToStaticKey))
-                    .apply(GroupIntoBatches.ofSize(getSetSize()));
+            batches = distinctValues.apply("Add Key", MapElements
+                            .into(TypeDescriptors.kvs(TypeDescriptors.strings(), TypeDescriptors.rows()))
+                            .via(r -> KV.of("a", r))).setCoder(KvCoder.of(StringUtf8Coder.of(), distinctValues.getCoder()))
+                    .apply(GroupIntoBatches.ofSize(getSetSize()))
+                    .setCoder(KvCoder.of(
+                            StringUtf8Coder.of(),
+                            IterableCoder.of(distinctValues.getCoder())
+                    ));
 
             return batches.apply("Read batches", opts.<KV<String, Iterable<Row>>>toReadAll()
                     .withQuery(generateSql())
